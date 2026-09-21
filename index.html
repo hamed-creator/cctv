@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>H.264 Camera Stream</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, sans-serif;
+      background: #111827;
+      color: #e5e7eb;
+    }
+
+    body {
+      display: grid;
+      min-height: 100vh;
+      margin: 0;
+      place-items: center;
+    }
+
+    main {
+      width: min(100% - 2rem, 960px);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      min-height: 240px;
+      background: #030712;
+      object-fit: contain;
+    }
+
+    #status {
+      margin-top: 0.75rem;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <canvas id="video" aria-label="Live camera stream"></canvas>
+    <p id="status" role="status">Starting decoder...</p>
+  </main>
+  <script src="app.js?v=5"></script>
+</body>
+</html>
