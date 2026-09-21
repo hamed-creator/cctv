@@ -19,6 +19,9 @@ const IDLE_SHUTDOWN_MS = Number(process.env.IDLE_SHUTDOWN_MS || 15000);
 // If FFmpeg produces no bytes for this long, assume the RTSP session is wedged
 // and restart it. Version-independent alternative to -stimeout/-timeout.
 const DATA_WATCHDOG_MS = Number(process.env.DATA_WATCHDOG_MS || 10000);
+const RTSP_ANALYZE_DURATION = process.env.RTSP_ANALYZE_DURATION || '1000000';
+const RTSP_PROBE_SIZE = process.env.RTSP_PROBE_SIZE || '1000000';
+const RTSP_BUFFER_SIZE = process.env.RTSP_BUFFER_SIZE || '32M';
 
 const RESTART_BASE_MS = 1000;
 const RESTART_MAX_MS = 30000;
@@ -356,10 +359,9 @@ class Camera extends EventEmitter {
       '-hide_banner',
       '-loglevel', 'warning',
       '-rtsp_transport', 'tcp',
-      '-fflags', 'nobuffer',
-      '-flags', 'low_delay',
-      '-analyzeduration', '0',
-      '-probesize', '32',
+      '-rtbufsize', RTSP_BUFFER_SIZE,
+      '-analyzeduration', RTSP_ANALYZE_DURATION,
+      '-probesize', RTSP_PROBE_SIZE,
       '-i', this.url,
       '-an',
       '-c:v', 'copy',

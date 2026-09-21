@@ -22,8 +22,11 @@ import { CameraStream } from './app.js';
 
 const wall = document.querySelector('#wall');
 const streams = new Map();
+const socketProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
 function addCamera(id, label) {
+  if (streams.has(String(id))) return;
+
   const figure = document.createElement('figure');
   const canvas = document.createElement('canvas');
   const caption = document.createElement('figcaption');
@@ -36,7 +39,7 @@ function addCamera(id, label) {
   wall.append(figure);
 
   const stream = new CameraStream(
-    `ws://${location.host}/camera/${id}`,
+    `${socketProtocol}//${location.host}/camera/${encodeURIComponent(id)}`,
     canvas,
   );
 
@@ -60,9 +63,15 @@ function removeCamera(id) {
   streams.delete(id);
 }
 
-// Two cameras, independent instances, same page.
-addCamera('1', 'Front gate');
-addCamera('2', 'Loading bay');
+async function loadCameras() {
+  const response = await fetch('/api/cameras');
+  if (!response.ok) {
+    throw new Error(`Camera configuration request failed (${response.status})`);
+  }
+
+  const cameras = await response.json();
+  cameras.forEach((camera) => addCamera(camera.id, camera.name));
+}
 
 window.addEventListener('pagehide', () => {
   for (const id of [...streams.keys()]) removeCamera(id);
@@ -70,6 +79,10 @@ window.addEventListener('pagehide', () => {
 
 // Exposed for console experimentation.
 Object.assign(window, { addCamera, removeCamera, streams });
+
+loadCameras().catch((error) => {
+  wall.textContent = `Unable to load cameras: ${error.message}`;
+});
 </script>
 </body>
 </html>
