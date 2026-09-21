@@ -1,207 +1,483 @@
-const WEBSOCKET_URL = `ws://${window.location.host || 'localhost:8080'}`;
-const H264_CODEC = 'avc1.64001F';
-const FRAME_DURATION_MICROSECONDS = Math.round(1000000 / 30);
-const MAX_BUFFERED_FRAMES = 60;
-const TARGET_BUFFER_MS = 250;
+/**
+ * CameraStream
+ *
+ * One instance drives one <canvas> from one WebSocket endpoint. All decoder,
+ * jitter buffer and resync state lives on the instance, so any number of
+ * instances can coexist on a page without interfering.
+ *
+ * Usage:
+ *   const stream = new CameraStream('ws://host/camera/1', canvasElement);
+ *   stream.start();
+ *   ...
+ *   stream.destroy();
+ */
 
-const canvas = document.querySelector('#video');
-const context = canvas.getContext('2d');
-const status = document.querySelector('#status');
+const DEFAULTS = {
+  codec: 'avc1.64001F',
+  nominalFps: 30,
+  maxBufferedFrames: 60,
+  targetBufferMs: 250,
+  reconnectBaseMs: 1000,
+  reconnectMaxMs: 15000,
+  autoReconnect: true,
+};
 
-if (!context) {
-  throw new Error('A 2D canvas context is required');
-}
+export class CameraStream extends EventTarget {
+  static isSupported() {
+    return typeof window !== 'undefined'
+      && 'VideoDecoder' in window
+      && 'EncodedVideoChunk' in window;
+  }
 
-if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
-  status.textContent = 'This browser does not support the WebCodecs VideoDecoder API.';
-  throw new Error('WebCodecs VideoDecoder is unavailable');
-}
+  constructor(url, canvas, options = {}) {
+    super();
 
-function nalTypesIn(data) {
-  const types = [];
-
-  for (let index = 0; index + 3 < data.length; index += 1) {
-    if (data[index] !== 0 || data[index + 1] !== 0) {
-      continue;
+    if (!url) {
+      throw new Error('CameraStream requires a WebSocket URL');
+    }
+    if (!canvas || !(canvas instanceof HTMLCanvasElement)) {
+      throw new Error('CameraStream requires a target <canvas> element');
     }
 
-    if (data[index + 2] === 1) {
-      types.push(data[index + 3] & 0x1f);
-      index += 2;
-      continue;
+    this.url = url;
+    this.canvas = canvas;
+    this.options = { ...DEFAULTS, ...options };
+
+    this.context = canvas.getContext('2d');
+    if (!this.context) {
+      throw new Error('A 2D canvas context is required');
     }
 
-    if (data[index + 2] === 0 && data[index + 3] === 1 && index + 4 < data.length) {
-      types.push(data[index + 4] & 0x1f);
-      index += 3;
+    // --- Encapsulated per-instance state -----------------------------------
+    this.socket = null;
+    this.decoder = null;
+    this.frameQueue = [];
+    this.needsKeyframe = true;
+    this.nextTimestamp = 0;
+
+    this.destroyed = false;
+    this.running = false;
+    this.reconnectAttempts = 0;
+    this.reconnectTimer = null;
+    this.rafHandle = null;
+    this.statsTimer = null;
+
+    this.framePeriodMs = 1000 / this.options.nominalFps;
+    this.lastDrawTime = 0;
+
+    this.stats = {
+      fps: 0,
+      receivedPerSecond: 0,
+      decodedPerSecond: 0,
+      bufferedFrames: 0,
+      state: 'idle',
+    };
+
+    this._counters = { rendered: 0, received: 0, decoded: 0 };
+    this._windowStart = 0;
+
+    // Bound once so removeEventListener and cancelAnimationFrame work.
+    this._onOpen = this._onOpen.bind(this);
+    this._onMessage = this._onMessage.bind(this);
+    this._onClose = this._onClose.bind(this);
+    this._onSocketError = this._onSocketError.bind(this);
+    this._pump = this._pump.bind(this);
+    this._onDecodedFrame = this._onDecodedFrame.bind(this);
+    this._onDecoderError = this._onDecoderError.bind(this);
+    this._sampleStats = this._sampleStats.bind(this);
+  }
+
+  /* --------------------------------------------------------------------- *
+   * Lifecycle
+   * --------------------------------------------------------------------- */
+
+  start() {
+    if (this.destroyed) {
+      throw new Error('CameraStream has been destroyed');
     }
-  }
-
-  return types;
-}
-
-let nextTimestamp = 0;
-let needsKeyframe = true;
-let renderedFrames = 0;
-let receivedChunks = 0;
-let decodedFrames = 0;
-let fpsWindowStart = performance.now();
-
-// Jitter buffer. FFmpeg delivers in bursts, so decoded frames are queued and
-// released on a clock rather than all drawn inside one task.
-const frameQueue = [];
-let framePeriodMs = 1000 / 30;
-let lastDrawTime = 0;
-
-function drawFrame(frame) {
-  if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-    canvas.width = frame.displayWidth;
-    canvas.height = frame.displayHeight;
-  }
-
-  context.drawImage(frame, 0, 0, canvas.width, canvas.height);
-  frame.close();
-  renderedFrames += 1;
-}
-
-function pumpFrameQueue() {
-  requestAnimationFrame(pumpFrameQueue);
-
-  if (frameQueue.length === 0) {
-    return;
-  }
-
-  const now = performance.now();
-  const bufferedMs = frameQueue.length * framePeriodMs;
-
-  // Play out slightly fast when the buffer overfills, so bursts drain instead
-  // of accumulating latency.
-  const period = bufferedMs > TARGET_BUFFER_MS * 2 ? framePeriodMs / 2 : framePeriodMs;
-
-  if (now - lastDrawTime < period) {
-    return;
-  }
-
-  lastDrawTime = now;
-  drawFrame(frameQueue.shift());
-}
-
-requestAnimationFrame(pumpFrameQueue);
-
-function enqueueFrame(frame) {
-  decodedFrames += 1;
-
-  while (frameQueue.length >= MAX_BUFFERED_FRAMES) {
-    frameQueue.shift().close();
-  }
-
-  frameQueue.push(frame);
-}
-
-function createDecoder() {
-  const instance = new VideoDecoder({
-    output: enqueueFrame,
-    error(error) {
-      console.error('VideoDecoder error:', error);
-      resetDecoder();
-    },
-  });
-
-  instance.configure({
-    codec: H264_CODEC,
-    optimizeForLatency: true,
-    hardwareAcceleration: 'prefer-hardware',
-  });
-
-  return instance;
-}
-
-let decoder = createDecoder();
-
-function resetDecoder() {
-  try {
-    if (decoder.state !== 'closed') {
-      decoder.close();
+    if (this.running) {
+      return this;
     }
-  } catch (error) {
-    console.warn('Decoder close failed:', error.message);
+    if (!CameraStream.isSupported()) {
+      this._setState('unsupported');
+      return this;
+    }
+
+    this.running = true;
+    this._windowStart = performance.now();
+    this._createDecoder();
+    this._connect();
+
+    this.rafHandle = requestAnimationFrame(this._pump);
+    this.statsTimer = setInterval(this._sampleStats, 1000);
+
+    return this;
   }
 
-  while (frameQueue.length > 0) {
-    frameQueue.shift().close();
-  }
-
-  decoder = createDecoder();
-  needsKeyframe = true;
-  status.textContent = 'Resynchronizing video...';
-}
-
-setInterval(() => {
-  const now = performance.now();
-  const elapsedSeconds = (now - fpsWindowStart) / 1000;
-  const fps = renderedFrames / elapsedSeconds;
-  const receiveRate = receivedChunks / elapsedSeconds;
-  const decodeRate = decodedFrames / elapsedSeconds;
-
-  // Track the real stream rate so the jitter buffer paces to it.
-  if (decodeRate > 1) {
-    framePeriodMs = (framePeriodMs * 3 + 1000 / decodeRate) / 4;
-  }
-
-  renderedFrames = 0;
-  receivedChunks = 0;
-  decodedFrames = 0;
-  fpsWindowStart = now;
-
-  if (!needsKeyframe && socket.readyState === WebSocket.OPEN) {
-    status.textContent = `${fps.toFixed(1)} FPS drawn | ${receiveRate.toFixed(1)} recv/s `
-      + `| ${decodeRate.toFixed(1)} dec/s | buffer ${frameQueue.length}`;
-  }
-}, 1000);
-
-const socket = new WebSocket(WEBSOCKET_URL);
-socket.binaryType = 'arraybuffer';
-
-socket.addEventListener('open', () => {
-  status.textContent = 'Connected. Waiting for video...';
-});
-
-socket.addEventListener('message', (event) => {
-  if (!(event.data instanceof ArrayBuffer) || decoder.state !== 'configured') {
-    return;
-  }
-
-  const data = new Uint8Array(event.data);
-
-  try {
-    receivedChunks += 1;
-
-    const types = nalTypesIn(data);
-    const isKeyframe = types.includes(5) || types.includes(7);
-
-    // VideoDecoder rejects delta frames until it has decoded an IDR frame.
-    if (needsKeyframe && !isKeyframe) {
+  /**
+   * Full teardown. Closes the socket, closes the decoder, and explicitly
+   * closes every VideoFrame still held in the jitter buffer — VideoFrames hold
+   * GPU-side memory that garbage collection will not reclaim on its own.
+   */
+  destroy() {
+    if (this.destroyed) {
       return;
     }
 
-    decoder.decode(new EncodedVideoChunk({
-      type: isKeyframe ? 'key' : 'delta',
-      timestamp: nextTimestamp,
-      data,
-    }));
+    this.destroyed = true;
+    this.running = false;
 
-    nextTimestamp += FRAME_DURATION_MICROSECONDS;
-    needsKeyframe = false;
-  } catch (error) {
-    console.error('Unable to decode chunk:', error, 'bytes:', data.length);
-    resetDecoder();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.statsTimer) {
+      clearInterval(this.statsTimer);
+      this.statsTimer = null;
+    }
+    if (this.rafHandle !== null) {
+      cancelAnimationFrame(this.rafHandle);
+      this.rafHandle = null;
+    }
+
+    this._teardownSocket(1000, 'Client closed stream');
+    this._closeDecoder();
+    this._drainFrameQueue();
+
+    this._setState('destroyed');
   }
-});
 
-socket.addEventListener('close', () => {
-  status.textContent = 'WebSocket disconnected.';
-});
+  /* --------------------------------------------------------------------- *
+   * WebSocket
+   * --------------------------------------------------------------------- */
 
-socket.addEventListener('error', () => {
-  status.textContent = 'WebSocket connection failed.';
-});
+  _connect() {
+    if (this.destroyed || !this.running) {
+      return;
+    }
+
+    this._setState('connecting');
+
+    const socket = new WebSocket(this.url);
+    socket.binaryType = 'arraybuffer';
+    this.socket = socket;
+
+    socket.addEventListener('open', this._onOpen);
+    socket.addEventListener('message', this._onMessage);
+    socket.addEventListener('close', this._onClose);
+    socket.addEventListener('error', this._onSocketError);
+  }
+
+  _teardownSocket(code, reason) {
+    const socket = this.socket;
+    if (!socket) {
+      return;
+    }
+
+    socket.removeEventListener('open', this._onOpen);
+    socket.removeEventListener('message', this._onMessage);
+    socket.removeEventListener('close', this._onClose);
+    socket.removeEventListener('error', this._onSocketError);
+
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      try {
+        socket.close(code, reason);
+      } catch {
+        // Closing an already-closing socket is not an error worth surfacing.
+      }
+    }
+
+    this.socket = null;
+  }
+
+  _onOpen() {
+    this.reconnectAttempts = 0;
+    this._setState('connected');
+  }
+
+  _onClose() {
+    if (this.destroyed) {
+      return;
+    }
+    this._setState('disconnected');
+    this._scheduleReconnect();
+  }
+
+  _onSocketError() {
+    if (this.destroyed) {
+      return;
+    }
+    this._emit('error', { message: 'WebSocket connection failed' });
+  }
+
+  _scheduleReconnect() {
+    if (!this.options.autoReconnect || this.destroyed || this.reconnectTimer) {
+      return;
+    }
+
+    const delay = Math.min(
+      this.options.reconnectBaseMs * (2 ** this.reconnectAttempts),
+      this.options.reconnectMaxMs,
+    );
+    this.reconnectAttempts += 1;
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this._teardownSocket();
+      this._resetDecoder();
+      this._connect();
+    }, delay);
+  }
+
+  _onMessage(event) {
+    if (this.destroyed) {
+      return;
+    }
+
+    // Control frames arrive as text; video as ArrayBuffer.
+    if (typeof event.data === 'string') {
+      try {
+        this._emit('control', JSON.parse(event.data));
+      } catch {
+        // Ignore malformed control messages.
+      }
+      return;
+    }
+
+    if (!(event.data instanceof ArrayBuffer) || !this.decoder) {
+      return;
+    }
+    if (this.decoder.state !== 'configured') {
+      return;
+    }
+
+    const data = new Uint8Array(event.data);
+    this._counters.received += 1;
+
+    try {
+      const isKeyframe = CameraStream.containsKeyframe(data);
+
+      // VideoDecoder rejects delta frames until it has decoded an IDR.
+      if (this.needsKeyframe && !isKeyframe) {
+        return;
+      }
+
+      this.decoder.decode(new EncodedVideoChunk({
+        type: isKeyframe ? 'key' : 'delta',
+        timestamp: this.nextTimestamp,
+        data,
+      }));
+
+      this.nextTimestamp += Math.round(1000000 / this.options.nominalFps);
+      this.needsKeyframe = false;
+    } catch (error) {
+      this._emit('error', { message: `Decode failed: ${error.message}` });
+      this._resetDecoder();
+    }
+  }
+
+  /* --------------------------------------------------------------------- *
+   * Bitstream inspection
+   * --------------------------------------------------------------------- */
+
+  /**
+   * True when the access unit contains an IDR slice or a sequence parameter
+   * set. Emulation prevention guarantees 00 00 01 never appears inside payload
+   * data, so a linear start-code scan is safe.
+   */
+  static containsKeyframe(data) {
+    for (let index = 0; index + 3 < data.length; index += 1) {
+      if (data[index] !== 0 || data[index + 1] !== 0) {
+        continue;
+      }
+
+      let type = -1;
+      if (data[index + 2] === 1) {
+        type = data[index + 3] & 0x1f;
+        index += 2;
+      } else if (data[index + 2] === 0 && data[index + 3] === 1 && index + 4 < data.length) {
+        type = data[index + 4] & 0x1f;
+        index += 3;
+      }
+
+      if (type === 5 || type === 7) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* --------------------------------------------------------------------- *
+   * Decoder
+   * --------------------------------------------------------------------- */
+
+  _createDecoder() {
+    const decoder = new VideoDecoder({
+      output: this._onDecodedFrame,
+      error: this._onDecoderError,
+    });
+
+    decoder.configure({
+      codec: this.options.codec,
+      optimizeForLatency: true,
+      hardwareAcceleration: 'prefer-hardware',
+    });
+
+    this.decoder = decoder;
+    this.needsKeyframe = true;
+  }
+
+  _closeDecoder() {
+    if (!this.decoder) {
+      return;
+    }
+
+    try {
+      if (this.decoder.state !== 'closed') {
+        this.decoder.close();
+      }
+    } catch {
+      // A decoder already torn down by a fatal error throws here; harmless.
+    }
+
+    this.decoder = null;
+  }
+
+  _resetDecoder() {
+    if (this.destroyed) {
+      return;
+    }
+
+    this._closeDecoder();
+    this._drainFrameQueue();
+    this._createDecoder();
+    this._setState('resyncing');
+  }
+
+  _onDecoderError(error) {
+    this._emit('error', { message: `Decoder: ${error.message}` });
+    this._resetDecoder();
+  }
+
+  /* --------------------------------------------------------------------- *
+   * Jitter buffer and rendering
+   * --------------------------------------------------------------------- */
+
+  _onDecodedFrame(frame) {
+    if (this.destroyed) {
+      frame.close();
+      return;
+    }
+
+    this._counters.decoded += 1;
+
+    while (this.frameQueue.length >= this.options.maxBufferedFrames) {
+      this.frameQueue.shift().close();
+    }
+
+    this.frameQueue.push(frame);
+  }
+
+  /** Closes every buffered VideoFrame. Called on reset and on destroy. */
+  _drainFrameQueue() {
+    while (this.frameQueue.length > 0) {
+      const frame = this.frameQueue.shift();
+      try {
+        frame.close();
+      } catch {
+        // Already closed.
+      }
+    }
+  }
+
+  _pump() {
+    if (this.destroyed) {
+      return;
+    }
+
+    this.rafHandle = requestAnimationFrame(this._pump);
+
+    if (this.frameQueue.length === 0) {
+      return;
+    }
+
+    const now = performance.now();
+    const bufferedMs = this.frameQueue.length * this.framePeriodMs;
+
+    // Play out faster when the buffer overfills, so a burst drains instead of
+    // becoming permanent latency.
+    const period = bufferedMs > this.options.targetBufferMs * 2
+      ? this.framePeriodMs / 2
+      : this.framePeriodMs;
+
+    if (now - this.lastDrawTime < period) {
+      return;
+    }
+
+    this.lastDrawTime = now;
+    this._draw(this.frameQueue.shift());
+  }
+
+  _draw(frame) {
+    const { canvas, context } = this;
+
+    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+      canvas.width = frame.displayWidth;
+      canvas.height = frame.displayHeight;
+    }
+
+    context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    frame.close();
+    this._counters.rendered += 1;
+
+    if (this.stats.state !== 'streaming' && !this.needsKeyframe) {
+      this._setState('streaming');
+    }
+  }
+
+  /* --------------------------------------------------------------------- *
+   * Stats and events
+   * --------------------------------------------------------------------- */
+
+  _sampleStats() {
+    const now = performance.now();
+    const elapsed = (now - this._windowStart) / 1000;
+    if (elapsed <= 0) {
+      return;
+    }
+
+    const decodedPerSecond = this._counters.decoded / elapsed;
+
+    // Pace the jitter buffer to the stream's real frame rate.
+    if (decodedPerSecond > 1) {
+      this.framePeriodMs = (this.framePeriodMs * 3 + 1000 / decodedPerSecond) / 4;
+    }
+
+    this.stats = {
+      fps: this._counters.rendered / elapsed,
+      receivedPerSecond: this._counters.received / elapsed,
+      decodedPerSecond,
+      bufferedFrames: this.frameQueue.length,
+      state: this.stats.state,
+    };
+
+    this._counters = { rendered: 0, received: 0, decoded: 0 };
+    this._windowStart = now;
+
+    this._emit('stats', this.stats);
+  }
+
+  _setState(state) {
+    if (this.stats.state === state) {
+      return;
+    }
+    this.stats.state = state;
+    this._emit('state', { state });
+  }
+
+  _emit(type, detail) {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+}
+
+export default CameraStream;

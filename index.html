@@ -1,48 +1,75 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>H.264 Camera Stream</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      font-family: system-ui, sans-serif;
-      background: #111827;
-      color: #e5e7eb;
-    }
-
-    body {
-      display: grid;
-      min-height: 100vh;
-      margin: 0;
-      place-items: center;
-    }
-
-    main {
-      width: min(100% - 2rem, 960px);
-    }
-
-    canvas {
-      display: block;
-      width: 100%;
-      height: auto;
-      min-height: 240px;
-      background: #030712;
-      object-fit: contain;
-    }
-
-    #status {
-      margin-top: 0.75rem;
-      color: #9ca3af;
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera wall</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 16px; font: 14px/1.4 system-ui, sans-serif; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  figure { margin: 0; background: #111; border-radius: 8px; overflow: hidden; }
+  canvas { display: block; width: 100%; height: auto; background: #000; }
+  figcaption { display: flex; justify-content: space-between; gap: 8px;
+               padding: 6px 10px; color: #ddd; font-size: 12px; }
+</style>
 </head>
 <body>
-  <main>
-    <canvas id="video" aria-label="Live camera stream"></canvas>
-    <p id="status" role="status">Starting decoder...</p>
-  </main>
-  <script src="app.js?v=5"></script>
+<div class="grid" id="wall"></div>
+
+<script type="module">
+import { CameraStream } from './app.js';
+
+const wall = document.querySelector('#wall');
+const streams = new Map();
+
+function addCamera(id, label) {
+  const figure = document.createElement('figure');
+  const canvas = document.createElement('canvas');
+  const caption = document.createElement('figcaption');
+  const name = document.createElement('span');
+  const stats = document.createElement('span');
+
+  name.textContent = label;
+  figure.append(canvas, caption);
+  caption.append(name, stats);
+  wall.append(figure);
+
+  const stream = new CameraStream(
+    `ws://${location.host}/camera/${id}`,
+    canvas,
+  );
+
+  stream.addEventListener('stats', (event) => {
+    const { fps, bufferedFrames, state } = event.detail;
+    stats.textContent = `${state} · ${fps.toFixed(1)} fps · buf ${bufferedFrames}`;
+  });
+  stream.addEventListener('error', (event) => {
+    stats.textContent = event.detail.message;
+  });
+
+  stream.start();
+  streams.set(id, { stream, figure });
+}
+
+function removeCamera(id) {
+  const entry = streams.get(id);
+  if (!entry) return;
+  entry.stream.destroy();   // closes socket, decoder, and all buffered frames
+  entry.figure.remove();
+  streams.delete(id);
+}
+
+// Two cameras, independent instances, same page.
+addCamera('1', 'Front gate');
+addCamera('2', 'Loading bay');
+
+window.addEventListener('pagehide', () => {
+  for (const id of [...streams.keys()]) removeCamera(id);
+});
+
+// Exposed for console experimentation.
+Object.assign(window, { addCamera, removeCamera, streams });
+</script>
 </body>
 </html>

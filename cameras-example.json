@@ -1,0 +1,18 @@
+[
+  { "id": "1",  "name": "Front gate",     "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=1&subtype=0" },
+  { "id": "2",  "name": "Loading bay",    "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=2&subtype=0" },
+  { "id": "3",  "name": "Corridor A",     "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=3&subtype=0" },
+  { "id": "4",  "name": "Corridor B",     "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=4&subtype=0" },
+  { "id": "5",  "name": "Canteen",        "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=5&subtype=0" },
+  { "id": "6",  "name": "Car park north", "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=6&subtype=0" },
+  { "id": "7",  "name": "Car park south", "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=7&subtype=0" },
+  { "id": "8",  "name": "Reception",      "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=8&subtype=0" },
+  { "id": "9",  "name": "Stairwell 1",    "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=9&subtype=0" },
+  { "id": "10", "name": "Stairwell 2",    "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=10&subtype=0" },
+  { "id": "11", "name": "Store room",     "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=11&subtype=0" },
+  { "id": "12", "name": "Server room",    "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=12&subtype=0" },
+  { "id": "13", "name": "Field east",     "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=13&subtype=0" },
+  { "id": "14", "name": "Field west",     "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=14&subtype=0" },
+  { "id": "15", "name": "Side entrance",  "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=15&subtype=0" },
+  { "id": "16", "name": "Roof access",    "url": "rtsp://admin:PASSWORD@192.168.1.2:554/H264?ch=16&subtype=0" }
+]
