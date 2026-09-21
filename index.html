@@ -10,6 +10,8 @@
   .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   figure { margin: 0; background: #111; border-radius: 8px; overflow: hidden; }
   canvas { display: block; width: 100%; height: auto; background: #000; }
+  .preview { display: grid; min-height: 180px; place-items: center; background: #000; }
+  button { cursor: pointer; padding: 8px 12px; border: 1px solid #666; border-radius: 4px; }
   figcaption { display: flex; justify-content: space-between; gap: 8px;
                padding: 6px 10px; color: #ddd; font-size: 12px; }
 </style>
@@ -25,42 +27,61 @@ const streams = new Map();
 const socketProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
 function addCamera(id, label) {
-  if (streams.has(String(id))) return;
+  const cameraId = String(id);
+  if (streams.has(cameraId)) return streams.get(cameraId);
 
   const figure = document.createElement('figure');
   const canvas = document.createElement('canvas');
+  const preview = document.createElement('div');
+  const startButton = document.createElement('button');
   const caption = document.createElement('figcaption');
   const name = document.createElement('span');
   const stats = document.createElement('span');
 
+  preview.className = 'preview';
+  startButton.type = 'button';
+  startButton.textContent = 'Start stream';
+  preview.append(startButton);
+  canvas.hidden = true;
   name.textContent = label;
-  figure.append(canvas, caption);
+  stats.textContent = 'idle';
+  figure.append(preview, canvas, caption);
   caption.append(name, stats);
   wall.append(figure);
 
-  const stream = new CameraStream(
-    `${socketProtocol}//${location.host}/camera/${encodeURIComponent(id)}`,
-    canvas,
-  );
+  const entry = { stream: null, figure, canvas, preview, startButton };
 
-  stream.addEventListener('stats', (event) => {
-    const { fps, bufferedFrames, state } = event.detail;
-    stats.textContent = `${state} · ${fps.toFixed(1)} fps · buf ${bufferedFrames}`;
-  });
-  stream.addEventListener('error', (event) => {
-    stats.textContent = event.detail.message;
-  });
+  function startStream() {
+    if (entry.stream) return;
 
-  stream.start();
-  streams.set(id, { stream, figure });
+    entry.stream = new CameraStream(
+      `${socketProtocol}//${location.host}/camera/${encodeURIComponent(cameraId)}`,
+      canvas,
+    );
+    entry.stream.addEventListener('stats', (event) => {
+      const { fps, bufferedFrames, state } = event.detail;
+      stats.textContent = `${state} · ${fps.toFixed(1)} fps · buf ${bufferedFrames}`;
+    });
+    entry.stream.addEventListener('error', (event) => {
+      stats.textContent = event.detail.message;
+    });
+    entry.stream.start();
+    canvas.hidden = false;
+    preview.hidden = true;
+  }
+
+  startButton.addEventListener('click', startStream);
+  figure.addEventListener('dblclick', startStream);
+  streams.set(cameraId, entry);
+  return entry;
 }
 
 function removeCamera(id) {
-  const entry = streams.get(id);
+  const entry = streams.get(String(id));
   if (!entry) return;
-  entry.stream.destroy();   // closes socket, decoder, and all buffered frames
+  entry.stream?.destroy();
   entry.figure.remove();
-  streams.delete(id);
+  streams.delete(String(id));
 }
 
 async function loadCameras() {
