@@ -63,6 +63,7 @@ export class CameraStream extends EventTarget {
     this.statsTimer = null;
 
     this.framePeriodMs = 1000 / this.options.nominalFps;
+    this.hasRateEstimate = false;
     this.lastDrawTime = 0;
 
     this.stats = {
@@ -398,6 +399,13 @@ export class CameraStream extends EventTarget {
     this.rafHandle = requestAnimationFrame(this._pump);
 
     if (this.frameQueue.length === 0) {
+      if (this.stats.state === 'streaming') {
+        this._setState('buffering');
+      }
+      return;
+    }
+
+    if (!this.hasRateEstimate) {
       return;
     }
 
@@ -450,7 +458,11 @@ export class CameraStream extends EventTarget {
 
     // Pace the jitter buffer to the stream's real frame rate.
     if (decodedPerSecond > 1) {
-      this.framePeriodMs = (this.framePeriodMs * 3 + 1000 / decodedPerSecond) / 4;
+      const measuredPeriodMs = 1000 / decodedPerSecond;
+      this.framePeriodMs = this.hasRateEstimate
+        ? (this.framePeriodMs * 3 + measuredPeriodMs) / 4
+        : measuredPeriodMs;
+      this.hasRateEstimate = true;
     }
 
     this.stats = {

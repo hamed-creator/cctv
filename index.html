@@ -62,6 +62,9 @@ function addCamera(id, label) {
       const { fps, bufferedFrames, state } = event.detail;
       stats.textContent = `${state} · ${fps.toFixed(1)} fps · buf ${bufferedFrames}`;
     });
+    entry.stream.addEventListener('state', (event) => {
+      stats.textContent = event.detail.state;
+    });
     entry.stream.addEventListener('error', (event) => {
       stats.textContent = event.detail.message;
     });
