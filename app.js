@@ -20,6 +20,18 @@ const DEFAULTS = {
   reconnectBaseMs: 1000,
   reconnectMaxMs: 15000,
   autoReconnect: true,
+  // Frame with no new decoded output for this long while 'streaming' is
+  // reported as 'buffering' rather than silently stalling.
+  stallThresholdMs: 800,
+  // Number of initial inter-arrival samples averaged with equal weight before
+  // switching to a slower steady-state EMA. Keeps startup pacing converging
+  // in roughly this many frames instead of several seconds.
+  bootstrapSamples: 10,
+  steadyStateAlpha: 0.15,
+  // Consecutive decoder failures (after the hardware hint has already been
+  // dropped) before giving up and reporting 'unsupported' instead of
+  // resetting again.
+  maxConsecutiveDecoderErrors: 5,
 };
 
 export class CameraStream extends EventTarget {
@@ -27,6 +39,25 @@ export class CameraStream extends EventTarget {
     return typeof window !== 'undefined'
       && 'VideoDecoder' in window
       && 'EncodedVideoChunk' in window;
+  }
+
+  // Shared across every instance: hardware decode support for a codec is a
+  // property of the machine/browser, not of any one stream, so the same
+  // answer applies to every CameraStream on the page and only needs
+  // checking once per codec string for the lifetime of the page.
+  static _hardwareSupportCache = new Map();
+
+  static _supportsHardware(codec) {
+    if (!CameraStream._hardwareSupportCache.has(codec)) {
+      const probe = VideoDecoder.isConfigSupported({
+        codec,
+        hardwareAcceleration: 'prefer-hardware',
+      })
+        .then((result) => result.supported === true)
+        .catch(() => false);
+      CameraStream._hardwareSupportCache.set(codec, probe);
+    }
+    return CameraStream._hardwareSupportCache.get(codec);
   }
 
   constructor(url, canvas, options = {}) {
@@ -63,8 +94,24 @@ export class CameraStream extends EventTarget {
     this.statsTimer = null;
 
     this.framePeriodMs = 1000 / this.options.nominalFps;
-    this.hasRateEstimate = false;
     this.lastDrawTime = 0;
+
+    // Per-frame arrival pacing (replaces the old once-per-second estimate).
+    this._lastFrameArrival = null;
+    this._arrivalSampleCount = 0;
+
+    // Stall detection.
+    this._lastActivityAt = 0;
+
+    // Hardware decode is tried first, but a NotSupportedError from the
+    // decoder's async error() callback means THIS browser/GPU cannot decode
+    // this stream's actual profile/level with hardware acceleration —
+    // retrying the identical config just repeats the same failure forever.
+    // Drop the hint once, permanently for this instance, then fall back to
+    // software. If software also fails, stop resetting the decoder rather
+    // than spinning indefinitely.
+    this._preferHardware = true;
+    this._consecutiveDecoderErrors = 0;
 
     this.stats = {
       fps: 0,
@@ -106,7 +153,23 @@ export class CameraStream extends EventTarget {
 
     this.running = true;
     this._windowStart = performance.now();
-    this._createDecoder();
+    this._lastActivityAt = this._windowStart;
+
+    // Hardware decode support for a given codec is a fixed property of this
+    // machine/browser, not of any particular stream — check once (cached
+    // across every CameraStream instance on the page) instead of always
+    // attempting hardware first and paying for a guaranteed failure on
+    // every single stream start when it's already known to be unsupported.
+    CameraStream._supportsHardware(this.options.codec).then((supported) => {
+      if (this.destroyed) {
+        return;
+      }
+      this._preferHardware = supported;
+      this._createDecoder();
+    });
+
+    // The socket doesn't need the decoder to exist yet — incoming messages
+    // are safely dropped by _onMessage until the decoder above is ready.
     this._connect();
 
     this.rafHandle = requestAnimationFrame(this._pump);
@@ -254,6 +317,13 @@ export class CameraStream extends EventTarget {
 
     const data = new Uint8Array(event.data);
     this._counters.received += 1;
+    // Pacing is measured off message arrival, not decode output. Decode
+    // output timing is distorted right after (re)connect: the server primes
+    // a new client with its cached keyframe, then real-time frames resume
+    // immediately after, so the decoder briefly drains a small backlog
+    // faster than real-time. That produced a startup FPS overshoot when
+    // pacing was measured from decoded-frame timing instead.
+    this._trackArrivalInterval(performance.now());
 
     try {
       const isKeyframe = CameraStream.containsKeyframe(data);
@@ -318,11 +388,25 @@ export class CameraStream extends EventTarget {
       error: this._onDecoderError,
     });
 
-    decoder.configure({
+    const config = {
       codec: this.options.codec,
       optimizeForLatency: true,
-      hardwareAcceleration: 'prefer-hardware',
-    });
+    };
+
+    // Only requested while we haven't yet proven this browser/GPU rejects
+    // it for this stream's actual profile/level (see _onDecoderError).
+    if (this._preferHardware) {
+      config.hardwareAcceleration = 'prefer-hardware';
+    }
+
+    try {
+      decoder.configure(config);
+    } catch {
+      // Narrow safety net for a malformed config object throwing
+      // synchronously — distinct from the async NotSupportedError path
+      // that _onDecoderError handles.
+      decoder.configure({ codec: this.options.codec, optimizeForLatency: true });
+    }
 
     this.decoder = decoder;
     this.needsKeyframe = true;
@@ -352,11 +436,37 @@ export class CameraStream extends EventTarget {
     this._closeDecoder();
     this._drainFrameQueue();
     this._createDecoder();
+    // Don't let the gap across a resync be counted as a real frame interval.
+    this._lastFrameArrival = null;
     this._setState('resyncing');
   }
 
   _onDecoderError(error) {
     this._emit('error', { message: `Decoder: ${error.message}` });
+    this._consecutiveDecoderErrors += 1;
+
+    // First failure while still preferring hardware: this browser/GPU has
+    // just told us (asynchronously — configure() itself didn't throw) that
+    // it cannot hardware-decode this stream's actual profile/level. Retrying
+    // the identical hardware config produces the identical failure every
+    // time, so drop the hint once and try software instead of looping.
+    if (this._preferHardware) {
+      this._preferHardware = false;
+      this._resetDecoder();
+      return;
+    }
+
+    // Software decode also failed, or kept failing repeatedly. At this
+    // point resetting again cannot succeed — stop spinning and surface it
+    // as a terminal state instead of an endless "resyncing" flicker.
+    if (this._consecutiveDecoderErrors >= this.options.maxConsecutiveDecoderErrors) {
+      this._teardownSocket();
+      this._closeDecoder();
+      this._drainFrameQueue();
+      this._setState('unsupported');
+      return;
+    }
+
     this._resetDecoder();
   }
 
@@ -371,12 +481,47 @@ export class CameraStream extends EventTarget {
     }
 
     this._counters.decoded += 1;
+    this._lastActivityAt = performance.now();
+    this._consecutiveDecoderErrors = 0;
 
     while (this.frameQueue.length >= this.options.maxBufferedFrames) {
       this.frameQueue.shift().close();
     }
 
     this.frameQueue.push(frame);
+  }
+
+  /**
+   * Paces the jitter buffer directly off decoded-frame arrival intervals
+   * instead of a once-per-second rate estimate. The first `bootstrapSamples`
+   * intervals are averaged with equal weight (fast, unbiased convergence);
+   * afterward a slower EMA smooths out normal jitter. This means playback
+   * pacing reflects the real stream rate within a handful of frames rather
+   * than the several seconds a 1 Hz estimate starting from a 30fps guess
+   * would take.
+   */
+  _trackArrivalInterval(now) {
+    if (this._lastFrameArrival === null) {
+      this._lastFrameArrival = now;
+      return;
+    }
+
+    const interval = now - this._lastFrameArrival;
+    this._lastFrameArrival = now;
+
+    // Ignore outliers (e.g. the gap across a reconnect) rather than letting
+    // one bad sample distort pacing.
+    if (interval <= 0 || interval > 5000) {
+      return;
+    }
+
+    this._arrivalSampleCount += 1;
+
+    const alpha = this._arrivalSampleCount <= this.options.bootstrapSamples
+      ? 1 / this._arrivalSampleCount
+      : this.options.steadyStateAlpha;
+
+    this.framePeriodMs += alpha * (interval - this.framePeriodMs);
   }
 
   /** Closes every buffered VideoFrame. Called on reset and on destroy. */
@@ -399,13 +544,14 @@ export class CameraStream extends EventTarget {
     this.rafHandle = requestAnimationFrame(this._pump);
 
     if (this.frameQueue.length === 0) {
-      if (this.stats.state === 'streaming') {
+      const now = performance.now();
+      if (
+        this.stats.state === 'streaming'
+        && this._lastActivityAt > 0
+        && now - this._lastActivityAt > this.options.stallThresholdMs
+      ) {
         this._setState('buffering');
       }
-      return;
-    }
-
-    if (!this.hasRateEstimate) {
       return;
     }
 
@@ -438,7 +584,8 @@ export class CameraStream extends EventTarget {
     frame.close();
     this._counters.rendered += 1;
 
-    if (this.stats.state !== 'streaming' && !this.needsKeyframe) {
+    // Covers both the initial keyframe wait and recovery from a stall.
+    if ((this.stats.state === 'connected' || this.stats.state === 'buffering') && !this.needsKeyframe) {
       this._setState('streaming');
     }
   }
@@ -456,15 +603,8 @@ export class CameraStream extends EventTarget {
 
     const decodedPerSecond = this._counters.decoded / elapsed;
 
-    // Pace the jitter buffer to the stream's real frame rate.
-    if (decodedPerSecond > 1) {
-      const measuredPeriodMs = 1000 / decodedPerSecond;
-      this.framePeriodMs = this.hasRateEstimate
-        ? (this.framePeriodMs * 3 + measuredPeriodMs) / 4
-        : measuredPeriodMs;
-      this.hasRateEstimate = true;
-    }
-
+    // Pacing itself now happens per-frame in _trackArrivalInterval; this is
+    // reporting only.
     this.stats = {
       fps: this._counters.rendered / elapsed,
       receivedPerSecond: this._counters.received / elapsed,
