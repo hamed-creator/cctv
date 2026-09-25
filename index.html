@@ -100,8 +100,19 @@ async function loadCameras() {
   cameras.forEach((camera) => addCamera(camera.id, camera.name));
 }
 
-window.addEventListener('pagehide', () => {
-  for (const id of [...streams.keys()]) removeCamera(id);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'hidden') {
+    return;
+  }
+
+  for (const [, entry] of streams.entries()) {
+    if (!entry.stream) continue;
+    entry.stream.destroy();
+    entry.stream = null;
+    entry.canvas.hidden = true;
+    entry.preview.hidden = false;
+    entry.startButton.textContent = 'Resume stream';
+  }
 });
 
 // Exposed for console experimentation.
