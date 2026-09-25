@@ -6,26 +6,60 @@
 <title>Camera wall</title>
 <style>
   :root { color-scheme: light dark; }
+  [hidden] { 
+  display: none !important; 
+  }
   body { margin: 0; padding: 16px; font: 14px/1.4 system-ui, sans-serif; }
   .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  .grid.has-focus figure { display: none; }
+  .grid.has-focus figure.focused {
+    display: block;
+    grid-column: 1 / -1;
+  }
+  .grid.has-focus figure.focused .frame { aspect-ratio: 16 / 10; }
   figure { margin: 0; background: #111; border-radius: 8px; overflow: hidden; }
   .frame { position: relative; aspect-ratio: 16 / 9; background: #000; }
   canvas { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
   .preview { position: absolute; inset: 0; display: grid; min-height: 180px; place-items: center; background: #000; }
   button { cursor: pointer; padding: 8px 12px; border: 1px solid #666; border-radius: 4px; }
+  .badge { padding: 2px 6px; border-radius: 999px; background: #222; font-size: 11px; font-weight: 600; }
+  .badge[data-state="idle"],
+  .badge[data-state="destroyed"] { color: #b8b8b8; background: #282828; }
+  .badge[data-state="disconnected"],
+  .badge[data-state="unsupported"] { color: #f0a0a0; background: #321b1b; }
+  .badge[data-state="connecting"],
+  .badge[data-state="connected"],
+  .badge[data-state="buffering"],
+  .badge[data-state="resyncing"] { color: #f4c96b; background: #342b16; }
+  .badge[data-state="streaming"] { color: #8ee0a8; background: #173222; }
   figcaption { display: flex; justify-content: space-between; gap: 8px;
-               padding: 6px 10px; color: #ddd; font-size: 12px; }
+               min-width: 0; padding: 6px 10px; color: #ddd; font-size: 12px; }
+  .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stats { color: #999; white-space: nowrap; flex-shrink: 0; }
 </style>
 </head>
 <body>
+<div class="toolbar">
+  <span id="live-count"></span>
+  <button id="start-all" type="button">Start all</button>
+  <button id="stop-all" type="button">Stop all</button>
+</div>
 <div class="grid" id="wall"></div>
 
 <script type="module">
 import { CameraStream } from './app.js';
 
 const wall = document.querySelector('#wall');
+const liveCount = document.querySelector('#live-count');
+const startAllButton = document.querySelector('#start-all');
+const stopAllButton = document.querySelector('#stop-all');
 const streams = new Map();
 const socketProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+function updateLiveCount() {
+  const live = [...streams.values()].filter((entry) => entry.stream !== null).length;
+  liveCount.textContent = `${live} of ${streams.size} live`;
+}
 
 function addCamera(id, label) {
   const cameraId = String(id);
@@ -36,23 +70,32 @@ function addCamera(id, label) {
   const canvas = document.createElement('canvas');
   const preview = document.createElement('div');
   const startButton = document.createElement('button');
+  const stopButton = document.createElement('button');
   const caption = document.createElement('figcaption');
   const name = document.createElement('span');
+  const badge = document.createElement('span');
   const stats = document.createElement('span');
 
+  name.className = 'name';
+  stats.className = 'stats';
+  frame.className = 'frame';
   preview.className = 'preview';
   startButton.type = 'button';
   startButton.textContent = 'Start stream';
   preview.append(startButton);
+  stopButton.type = 'button';
+  stopButton.textContent = 'Stop stream';
+  stopButton.hidden = true;
   canvas.hidden = true;
   name.textContent = label;
+  badge.className = 'badge';
   stats.textContent = 'idle';
   frame.append(canvas, preview);
   figure.append(frame, caption);
-  caption.append(name, stats);
+  caption.append(name, badge, stats, stopButton);
   wall.append(figure);
 
-  const entry = { stream: null, figure, canvas, preview, startButton };
+  const entry = { cameraId, stream: null, figure, canvas, preview, startButton, stopButton };
 
   function startStream() {
     if (entry.stream) return;
@@ -61,12 +104,27 @@ function addCamera(id, label) {
       `${socketProtocol}//${location.host}/camera/${encodeURIComponent(cameraId)}`,
       canvas,
     );
+    updateLiveCount();
     entry.stream.addEventListener('stats', (event) => {
       const { fps, bufferedFrames, state } = event.detail;
       stats.textContent = `${state} · ${fps.toFixed(1)} fps · buf ${bufferedFrames}`;
     });
     entry.stream.addEventListener('state', (event) => {
-      stats.textContent = event.detail.state;
+      const state = event.detail.state;
+      const labels = {
+        idle: 'Idle',
+        connecting: 'Connecting',
+        connected: 'Connecting',
+        buffering: 'Buffering',
+        resyncing: 'Resyncing',
+        streaming: 'Live',
+        disconnected: 'Disconnected',
+        unsupported: 'Unsupported',
+        destroyed: 'Stopped',
+      };
+      badge.dataset.state = state;
+      badge.textContent = labels[state];
+      stats.textContent = state;
     });
     entry.stream.addEventListener('error', (event) => {
       stats.textContent = event.detail.message;
@@ -74,12 +132,53 @@ function addCamera(id, label) {
     entry.stream.start();
     canvas.hidden = false;
     preview.hidden = true;
+    startButton.hidden = true;
+    stopButton.hidden = false;
   }
 
-  startButton.addEventListener('click', startStream);
+  function stopStream() {
+    if (entry.stream) {
+      entry.stream.destroy();
+      entry.stream = null;
+      updateLiveCount();
+    }
+    entry.canvas.hidden = true;
+    entry.preview.hidden = false;
+    entry.startButton.hidden = false;
+    entry.stopButton.hidden = true;
+  }
+
+  entry.startStream = startStream;
+  entry.stopStream = stopStream;
+
+  startButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    startStream();
+  });
+  stopButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    stopStream();
+  });
+  figure.addEventListener('click', () => {
+    const isFocused = figure.classList.contains('focused');
+    wall.querySelector('figure.focused')?.classList.remove('focused');
+    figure.classList.toggle('focused', !isFocused);
+    wall.classList.toggle('has-focus', !isFocused);
+  });
   figure.addEventListener('dblclick', startStream);
   streams.set(cameraId, entry);
   return entry;
+}
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  wall.querySelector('figure.focused')?.classList.remove('focused');
+  wall.classList.remove('has-focus');
+});
+
+function stopStream(cameraId) {
+  const entry = streams.get(String(cameraId));
+  entry?.stopStream();
 }
 
 function removeCamera(id) {
@@ -98,7 +197,20 @@ async function loadCameras() {
 
   const cameras = await response.json();
   cameras.forEach((camera) => addCamera(camera.id, camera.name));
+  updateLiveCount();
 }
+
+startAllButton.addEventListener('click', () => {
+  for (const entry of streams.values()) {
+    if (!entry.stream) entry.startStream();
+  }
+});
+
+stopAllButton.addEventListener('click', () => {
+  for (const entry of streams.values()) {
+    if (entry.stream) entry.stopStream();
+  }
+});
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'hidden') {
@@ -107,16 +219,13 @@ document.addEventListener('visibilitychange', () => {
 
   for (const [, entry] of streams.entries()) {
     if (!entry.stream) continue;
-    entry.stream.destroy();
-    entry.stream = null;
-    entry.canvas.hidden = true;
-    entry.preview.hidden = false;
+    stopStream(entry.cameraId);
     entry.startButton.textContent = 'Resume stream';
   }
 });
 
 // Exposed for console experimentation.
-Object.assign(window, { addCamera, removeCamera, streams });
+Object.assign(window, { addCamera, removeCamera, stopStream, streams });
 
 loadCameras().catch((error) => {
   wall.textContent = `Unable to load cameras: ${error.message}`;
