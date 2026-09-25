@@ -28,9 +28,8 @@ const DEFAULTS = {
   // in roughly this many frames instead of several seconds.
   bootstrapSamples: 10,
   steadyStateAlpha: 0.15,
-  // Consecutive decoder failures (after the hardware hint has already been
-  // dropped) before giving up and reporting 'unsupported' instead of
-  // resetting again.
+  // Consecutive decoder failures before giving up and reporting 'unsupported'
+  // instead of resetting again.
   maxConsecutiveDecoderErrors: 5,
 };
 
@@ -39,25 +38,6 @@ export class CameraStream extends EventTarget {
     return typeof window !== 'undefined'
       && 'VideoDecoder' in window
       && 'EncodedVideoChunk' in window;
-  }
-
-  // Shared across every instance: hardware decode support for a codec is a
-  // property of the machine/browser, not of any one stream, so the same
-  // answer applies to every CameraStream on the page and only needs
-  // checking once per codec string for the lifetime of the page.
-  static _hardwareSupportCache = new Map();
-
-  static _supportsHardware(codec) {
-    if (!CameraStream._hardwareSupportCache.has(codec)) {
-      const probe = VideoDecoder.isConfigSupported({
-        codec,
-        hardwareAcceleration: 'prefer-hardware',
-      })
-        .then((result) => result.supported === true)
-        .catch(() => false);
-      CameraStream._hardwareSupportCache.set(codec, probe);
-    }
-    return CameraStream._hardwareSupportCache.get(codec);
   }
 
   constructor(url, canvas, options = {}) {
@@ -82,6 +62,9 @@ export class CameraStream extends EventTarget {
     // --- Encapsulated per-instance state -----------------------------------
     this.socket = null;
     this.decoder = null;
+    this.sps = null;
+    this.pps = null;
+    this.codecDescription = null;
     this.frameQueue = [];
     this.needsKeyframe = true;
     this.nextTimestamp = 0;
@@ -103,14 +86,6 @@ export class CameraStream extends EventTarget {
     // Stall detection.
     this._lastActivityAt = 0;
 
-    // Hardware decode is tried first, but a NotSupportedError from the
-    // decoder's async error() callback means THIS browser/GPU cannot decode
-    // this stream's actual profile/level with hardware acceleration —
-    // retrying the identical config just repeats the same failure forever.
-    // Drop the hint once, permanently for this instance, then fall back to
-    // software. If software also fails, stop resetting the decoder rather
-    // than spinning indefinitely.
-    this._preferHardware = true;
     this._consecutiveDecoderErrors = 0;
 
     this.stats = {
@@ -155,21 +130,7 @@ export class CameraStream extends EventTarget {
     this._windowStart = performance.now();
     this._lastActivityAt = this._windowStart;
 
-    // Hardware decode support for a given codec is a fixed property of this
-    // machine/browser, not of any particular stream — check once (cached
-    // across every CameraStream instance on the page) instead of always
-    // attempting hardware first and paying for a guaranteed failure on
-    // every single stream start when it's already known to be unsupported.
-    CameraStream._supportsHardware(this.options.codec).then((supported) => {
-      if (this.destroyed) {
-        return;
-      }
-      this._preferHardware = supported;
-      this._createDecoder();
-    });
-
-    // The socket doesn't need the decoder to exist yet — incoming messages
-    // are safely dropped by _onMessage until the decoder above is ready.
+    // The decoder is created after the first access unit supplies SPS/PPS.
     this._connect();
 
     this.rafHandle = requestAnimationFrame(this._pump);
@@ -308,14 +269,33 @@ export class CameraStream extends EventTarget {
       return;
     }
 
-    if (!(event.data instanceof ArrayBuffer) || !this.decoder) {
-      return;
-    }
-    if (this.decoder.state !== 'configured') {
+    if (!(event.data instanceof ArrayBuffer)) {
       return;
     }
 
     const data = new Uint8Array(event.data);
+    const nalUnits = CameraStream.parseAnnexB(data);
+    if (nalUnits.length === 0) {
+      return;
+    }
+
+    if (!this.codecDescription) {
+      this.sps ||= nalUnits.find((nalUnit) => (nalUnit[0] & 0x1f) === 7);
+      this.pps ||= nalUnits.find((nalUnit) => (nalUnit[0] & 0x1f) === 8);
+      if (this.sps && this.pps) {
+        this.codecDescription = CameraStream.createAvcC(this.sps, this.pps);
+      }
+    }
+    if (!this.codecDescription) {
+      return;
+    }
+    if (!this.decoder) {
+      this._createDecoder();
+    }
+    if (!this.decoder || this.decoder.state !== 'configured') {
+      return;
+    }
+
     this._counters.received += 1;
     // Pacing is measured off message arrival, not decode output. Decode
     // output timing is distorted right after (re)connect: the server primes
@@ -326,17 +306,22 @@ export class CameraStream extends EventTarget {
     this._trackArrivalInterval(performance.now());
 
     try {
-      const isKeyframe = CameraStream.containsKeyframe(data);
+      const isKeyframe = nalUnits.some((nalUnit) => (nalUnit[0] & 0x1f) === 5);
 
       // VideoDecoder rejects delta frames until it has decoded an IDR.
       if (this.needsKeyframe && !isKeyframe) {
         return;
       }
 
+      const sample = CameraStream.toAvcSample(nalUnits);
+      if (sample.byteLength === 0) {
+        return;
+      }
+
       this.decoder.decode(new EncodedVideoChunk({
         type: isKeyframe ? 'key' : 'delta',
         timestamp: this.nextTimestamp,
-        data,
+        data: sample,
       }));
 
       this.nextTimestamp += Math.round(1000000 / this.options.nominalFps);
@@ -351,34 +336,90 @@ export class CameraStream extends EventTarget {
    * Bitstream inspection
    * --------------------------------------------------------------------- */
 
-  /**
-   * True when the access unit contains an IDR slice or a sequence parameter
-   * set. Emulation prevention guarantees 00 00 01 never appears inside payload
-   * data, so a linear start-code scan is safe.
-   */
-  static containsKeyframe(data) {
-    for (let index = 0; index + 3 < data.length; index += 1) {
+  static parseAnnexB(data) {
+    const nalUnits = [];
+    let nalStart = -1;
+    let startCodeLength = 0;
+
+    for (let index = 0; index + 2 < data.length; index += 1) {
       if (data[index] !== 0 || data[index + 1] !== 0) {
         continue;
       }
 
-      let type = -1;
-      if (data[index + 2] === 1) {
-        type = data[index + 3] & 0x1f;
-        index += 2;
-      } else if (data[index + 2] === 0 && data[index + 3] === 1 && index + 4 < data.length) {
-        type = data[index + 4] & 0x1f;
-        index += 3;
+      const currentStartCodeLength = data[index + 2] === 1
+        ? 3
+        : data[index + 2] === 0 && data[index + 3] === 1
+          ? 4
+          : 0;
+      if (currentStartCodeLength === 0) {
+        continue;
       }
 
-      if (type === 5 || type === 7) {
-        return true;
+      if (nalStart !== -1) {
+        const nalUnit = data.subarray(nalStart + startCodeLength, index);
+        if (nalUnit.length > 0) {
+          nalUnits.push(nalUnit);
+        }
       }
-      if (type === 1) {
-        return false;
+
+      nalStart = index;
+      startCodeLength = currentStartCodeLength;
+      index += currentStartCodeLength - 1;
+    }
+
+    if (nalStart !== -1) {
+      const nalUnit = data.subarray(nalStart + startCodeLength);
+      if (nalUnit.length > 0) {
+        nalUnits.push(nalUnit);
       }
     }
-    return false;
+
+    return nalUnits;
+  }
+
+  static createAvcC(sps, pps) {
+    if (sps.length < 4 || pps.length === 0) {
+      return null;
+    }
+
+    const description = new Uint8Array(11 + sps.length + pps.length);
+    let offset = 0;
+    description[offset++] = 1;
+    description[offset++] = sps[1];
+    description[offset++] = sps[2];
+    description[offset++] = sps[3];
+    description[offset++] = 0xff;
+    description[offset++] = 0xe1;
+    description[offset++] = sps.length >> 8;
+    description[offset++] = sps.length & 0xff;
+    description.set(sps, offset);
+    offset += sps.length;
+    description[offset++] = 1;
+    description[offset++] = pps.length >> 8;
+    description[offset++] = pps.length & 0xff;
+    description.set(pps, offset);
+    return description;
+  }
+
+  static toAvcSample(nalUnits) {
+    const samples = nalUnits.filter((nalUnit) => {
+      const type = nalUnit[0] & 0x1f;
+      return type !== 7 && type !== 8;
+    });
+    const size = samples.reduce((total, nalUnit) => total + 4 + nalUnit.length, 0);
+    const sample = new Uint8Array(size);
+    let offset = 0;
+
+    for (const nalUnit of samples) {
+      sample[offset++] = nalUnit.length >>> 24;
+      sample[offset++] = nalUnit.length >>> 16;
+      sample[offset++] = nalUnit.length >>> 8;
+      sample[offset++] = nalUnit.length;
+      sample.set(nalUnit, offset);
+      offset += nalUnit.length;
+    }
+
+    return sample;
   }
 
   /* --------------------------------------------------------------------- *
@@ -394,16 +435,16 @@ export class CameraStream extends EventTarget {
     const config = {
       codec: this.options.codec,
       optimizeForLatency: true,
-      hardwareAcceleration: 'prefer-hardware',
+      description: this.codecDescription,
     };
 
     try {
       decoder.configure(config);
     } catch {
-      // Narrow safety net for a malformed config object throwing
-      // synchronously — distinct from the async NotSupportedError path
-      // that _onDecoderError handles.
-      decoder.configure({ codec: this.options.codec, optimizeForLatency: true });
+      decoder.close();
+      this._emit('error', { message: 'Decoder configuration failed' });
+      this._setState('unsupported');
+      return;
     }
 
     this.decoder = decoder;
@@ -443,20 +484,6 @@ export class CameraStream extends EventTarget {
     this._emit('error', { message: `Decoder: ${error.message}` });
     this._consecutiveDecoderErrors += 1;
 
-    // First failure while still preferring hardware: this browser/GPU has
-    // just told us (asynchronously — configure() itself didn't throw) that
-    // it cannot hardware-decode this stream's actual profile/level. Retrying
-    // the identical hardware config produces the identical failure every
-    // time, so drop the hint once and try software instead of looping.
-    if (this._preferHardware) {
-      this._preferHardware = false;
-      this._resetDecoder();
-      return;
-    }
-
-    // Software decode also failed, or kept failing repeatedly. At this
-    // point resetting again cannot succeed — stop spinning and surface it
-    // as a terminal state instead of an endless "resyncing" flicker.
     if (this._consecutiveDecoderErrors >= this.options.maxConsecutiveDecoderErrors) {
       this._teardownSocket();
       this._closeDecoder();
