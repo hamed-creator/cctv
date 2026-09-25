@@ -371,9 +371,12 @@ export class CameraStream extends EventTarget {
         index += 3;
       }
 
-      if (type === 5 || type === 7) {
-        return true;
-      }
+        if (type === 5 || type === 7) {
+          return true;
+        }
+        if (type === 1) {
+          return false; // Early exit prevents scanning the entire delta payload
+        }
     }
     return false;
   }
