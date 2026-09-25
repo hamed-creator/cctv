@@ -391,13 +391,8 @@ export class CameraStream extends EventTarget {
     const config = {
       codec: this.options.codec,
       optimizeForLatency: true,
+      hardwareAcceleration: 'prefer-software',
     };
-
-    // Only requested while we haven't yet proven this browser/GPU rejects
-    // it for this stream's actual profile/level (see _onDecoderError).
-    if (this._preferHardware) {
-      config.hardwareAcceleration = 'prefer-hardware';
-    }
 
     try {
       decoder.configure(config);
