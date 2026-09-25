@@ -374,6 +374,9 @@ export class CameraStream extends EventTarget {
       if (type === 5 || type === 7) {
         return true;
       }
+      if (type === 1) {
+        return false;
+      }
     }
     return false;
   }

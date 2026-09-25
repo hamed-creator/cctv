@@ -358,6 +358,7 @@ class Camera extends EventEmitter {
     return [
       '-hide_banner',
       '-loglevel', 'warning',
+      '-fflags', '+genpts',
       '-rtsp_transport', 'tcp',
       '-rtbufsize', RTSP_BUFFER_SIZE,
       '-analyzeduration', RTSP_ANALYZE_DURATION,
@@ -530,9 +531,15 @@ class Camera extends EventEmitter {
         continue;
       }
 
-      // Shed delta frames for clients that cannot keep up; always let a
-      // keyframe through so they can resynchronise.
-      if (!keyframe && client.bufferedAmount > CLIENT_BUFFER_LIMIT_BYTES) {
+      if (client.bufferedAmount > CLIENT_BUFFER_LIMIT_BYTES) {
+        client.needsKeyframe = true;
+      }
+
+      if (keyframe) {
+        client.needsKeyframe = false;
+      }
+
+      if (client.needsKeyframe) {
         continue;
       }
 
