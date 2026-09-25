@@ -29,7 +29,7 @@ const SIGKILL_GRACE_MS = 3000;
 
 // Per-client send buffer ceiling. Past this, delta frames are dropped for that
 // client so one slow browser cannot balloon server memory.
-const CLIENT_BUFFER_LIMIT_BYTES = 2 * 1024 * 1024;
+const CLIENT_BUFFER_LIMIT_BYTES = 10 * 1024 * 1024;
 
 const ffmpegPath = process.env.FFMPEG_PATH || bundledFfmpegPath;
 if (!ffmpegPath) {
