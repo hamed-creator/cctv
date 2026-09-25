@@ -13,7 +13,7 @@
  */
 
 const DEFAULTS = {
-  codec: 'avc1.64001F',
+  codec: 'avc1.640029',
   nominalFps: 30,
   maxBufferedFrames: 60,
   targetBufferMs: 250,
@@ -394,7 +394,7 @@ export class CameraStream extends EventTarget {
     const config = {
       codec: this.options.codec,
       optimizeForLatency: true,
-      hardwareAcceleration: 'prefer-software',
+      hardwareAcceleration: 'prefer-hardware',
     };
 
     try {
