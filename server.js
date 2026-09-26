@@ -377,7 +377,7 @@ class Camera extends EventEmitter {
       '-hide_banner',
       '-loglevel', 'warning',
       '-fflags', '+genpts',
-      '-rtsp_transport', 'tcp',
+      '-rtsp_transport', 'udp',
       '-rtbufsize', RTSP_BUFFER_SIZE,
       '-analyzeduration', RTSP_ANALYZE_DURATION,
       '-probesize', RTSP_PROBE_SIZE,
@@ -437,7 +437,9 @@ class Camera extends EventEmitter {
       this.stats.bytes += chunk.length;
       this.stats.lastDataAt = Date.now();
       this.#kickWatchdog();
-      this.demuxer.push(chunk);
+      if (this.demuxer) {
+        this.demuxer.push(chunk);
+      }
     });
 
     child.stderr.on('data', (chunk) => {
