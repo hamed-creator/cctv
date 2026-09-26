@@ -27,9 +27,11 @@ const RESTART_BASE_MS = 1000;
 const RESTART_MAX_MS = 30000;
 const SIGKILL_GRACE_MS = 3000;
 
-// Per-client send buffer ceiling. Past this, delta frames are dropped for that
-// client so one slow browser cannot balloon server memory.
-const CLIENT_BUFFER_LIMIT_BYTES = 10 * 1024 * 1024;
+// Two-tier per-client send buffer limits. Past the soft limit, only
+// non-reference frames are dropped (minor quality loss, playback continues).
+// Past the hard limit, all frames are dropped until the next keyframe.
+const CLIENT_SOFT_BUFFER_BYTES = 5 * 1024 * 1024;
+const CLIENT_HARD_BUFFER_BYTES = 8 * 1024 * 1024;
 
 const ffmpegPath = process.env.FFMPEG_PATH || bundledFfmpegPath;
 if (!ffmpegPath) {
@@ -221,10 +223,19 @@ class AnnexBDemuxer extends EventEmitter {
       unit = [this.sps, this.pps, ...this.accessUnit];
     }
 
+    // A frame is "reference" if any of its video slices have nal_ref_idc != 0.
+    // Non-reference frames can be safely dropped under back-pressure without
+    // harming subsequent decoding.
+    const isReference = keyframe || this.accessUnit.some((nal) => {
+      const sc = AnnexBDemuxer.startCodeLength(nal);
+      const type = nal[sc] & 0x1f;
+      return (type === 1 || type === 5) && ((nal[sc] >> 5) & 0x3) !== 0;
+    });
+
     this.accessUnit = [];
     this.containsVideoSlice = false;
 
-    this.emit('access-unit', Buffer.concat(unit), keyframe || types.includes(7));
+    this.emit('access-unit', Buffer.concat(unit), keyframe || types.includes(7), isReference);
   }
 }
 
@@ -261,6 +272,13 @@ class Camera extends EventEmitter {
     this.process = null;
     this.demuxer = null;
     this.lastKeyframe = null;
+
+    // Server-side send queue: frames from the demuxer are queued here and
+    // drained one per tick by a setInterval timer.  This smooths out the
+    // bursty delivery from FFmpeg's stdout pipe (especially on Windows) so
+    // clients receive frames at a steady cadence rather than in clumps.
+    this.sendQueue = [];
+    this.sendTimer = null;
 
     this.idleTimer = null;
     this.restartTimer = null;
@@ -389,14 +407,26 @@ class Camera extends EventEmitter {
     this.stats.startedAt = Date.now();
 
     this.demuxer = new AnnexBDemuxer();
-    this.demuxer.on('access-unit', (buffer, keyframe) => {
+    this.demuxer.on('access-unit', (buffer, keyframe, isReference) => {
       this.stats.accessUnits += 1;
       if (keyframe) {
         this.stats.keyframes += 1;
         this.lastKeyframe = buffer;
       }
-      this.broadcast(buffer, keyframe);
+      // Queue frame for smoothed delivery instead of broadcasting instantly.
+      this.sendQueue.push({ buffer, keyframe, isReference });
     });
+
+    // Drain the send queue at a steady cadence (approx 20ms = 50 fps max drain rate)
+    // to smooth out pipe bursts before they hit the WebSocket. If a large burst
+    // arrived, drain slightly faster to avoid building permanent latency.
+    this.sendTimer = setInterval(() => {
+      const framesToDrain = this.sendQueue.length > 5 ? 2 : 1;
+      for (let i = 0; i < framesToDrain && this.sendQueue.length > 0; i++) {
+        const { buffer, keyframe, isReference } = this.sendQueue.shift();
+        this.broadcast(buffer, keyframe, isReference);
+      }
+    }, 20);
 
     child.stdout.on('data', (chunk) => {
       if (this.state !== CameraState.STREAMING) {
@@ -479,9 +509,10 @@ class Camera extends EventEmitter {
   }
 
   #clearTimers() {
-    for (const key of ['watchdogTimer', 'restartTimer', 'idleTimer']) {
+    for (const key of ['watchdogTimer', 'restartTimer', 'idleTimer', 'sendTimer']) {
       if (this[key]) {
         clearTimeout(this[key]);
+        clearInterval(this[key]);
         this[key] = null;
       }
     }
@@ -511,6 +542,7 @@ class Camera extends EventEmitter {
     this.#clearTimers();
     this.restartAttempts = 0;
     this.lastKeyframe = null;
+    this.sendQueue = [];
 
     if (this.demuxer) {
       this.demuxer.removeAllListeners();
@@ -525,14 +557,26 @@ class Camera extends EventEmitter {
     }
   }
 
-  broadcast(buffer, keyframe) {
+  broadcast(buffer, keyframe, isReference) {
     for (const client of this.clients) {
       if (client.readyState !== client.OPEN) {
         continue;
       }
 
-      if (client.bufferedAmount > CLIENT_BUFFER_LIMIT_BYTES) {
+      // Initialize stats on first use
+      if (!client.stats) {
+        client.stats = { sent: 0, droppedSoft: 0, droppedHard: 0 };
+      }
+
+      // Two-tier back-pressure: soft limit drops non-reference frames (minor
+      // quality loss, playback continues); hard limit drops everything until
+      // the next keyframe (visible freeze but prevents runaway memory).
+      if (client.bufferedAmount > CLIENT_HARD_BUFFER_BYTES) {
         client.needsKeyframe = true;
+        client.stats.droppedHard += 1;
+      } else if (client.bufferedAmount > CLIENT_SOFT_BUFFER_BYTES && !isReference && !keyframe) {
+        client.stats.droppedSoft += 1;
+        continue;
       }
 
       if (keyframe) {
@@ -540,9 +584,11 @@ class Camera extends EventEmitter {
       }
 
       if (client.needsKeyframe) {
+        client.stats.droppedHard += 1;
         continue;
       }
 
+      client.stats.sent += 1;
       client.send(buffer);
     }
   }
@@ -556,6 +602,22 @@ class Camera extends EventEmitter {
   }
 
   toJSON() {
+    let clientsSent = 0;
+    let clientsDroppedSoft = 0;
+    let clientsDroppedHard = 0;
+    let maxBufferedAmount = 0;
+
+    for (const c of this.clients) {
+      if (c.stats) {
+        clientsSent += c.stats.sent;
+        clientsDroppedSoft += c.stats.droppedSoft;
+        clientsDroppedHard += c.stats.droppedHard;
+      }
+      if (c.bufferedAmount > maxBufferedAmount) {
+        maxBufferedAmount = c.bufferedAmount;
+      }
+    }
+
     return {
       id: this.id,
       name: this.name,
@@ -563,10 +625,14 @@ class Camera extends EventEmitter {
       clients: this.clients.size,
       accessUnits: this.stats.accessUnits,
       keyframes: this.stats.keyframes,
+      sendQueue: this.sendQueue ? this.sendQueue.length : 0,
       kilobytes: Math.round(this.stats.bytes / 1024),
       uptimeSeconds: this.stats.startedAt
         ? Math.round((Date.now() - this.stats.startedAt) / 1000)
         : 0,
+      dropsSoft: clientsDroppedSoft,
+      dropsHard: clientsDroppedHard,
+      maxBufferedAmount: Math.round(maxBufferedAmount / 1024), // in KB
     };
   }
 

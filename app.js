@@ -14,19 +14,19 @@
 
 const DEFAULTS = {
   codec: 'avc1.640029',
-  nominalFps: 30,
-  maxBufferedFrames: 60,
-  targetBufferMs: 250,
+  nominalFps: 25,
+  maxBufferedFrames: 30,
+  maxQueuedFrames: 15,
   reconnectBaseMs: 1000,
   reconnectMaxMs: 15000,
   autoReconnect: true,
   // Frame with no new decoded output for this long while 'streaming' is
   // reported as 'buffering' rather than silently stalling.
-  stallThresholdMs: 800,
+  stallThresholdMs: 1500,
   // Number of initial inter-arrival samples averaged with equal weight before
   // switching to a slower steady-state EMA. Keeps startup pacing converging
   // in roughly this many frames instead of several seconds.
-  bootstrapSamples: 10,
+  bootstrapSamples: 3,
   steadyStateAlpha: 0.15,
   // Consecutive decoder failures before giving up and reporting 'unsupported'
   // instead of resetting again.
@@ -97,6 +97,7 @@ export class CameraStream extends EventTarget {
     };
 
     this._counters = { rendered: 0, received: 0, decoded: 0 };
+    this.cumulativeStats = { dropsPump: 0, dropsBuffer: 0, decoderErrors: 0 };
     this._windowStart = 0;
 
     // Bound once so removeEventListener and cancelAnimationFrame work.
@@ -475,6 +476,8 @@ export class CameraStream extends EventTarget {
     this._closeDecoder();
     this._drainFrameQueue();
     this._createDecoder();
+    this.nextDrawTime = null;
+    this.pll = undefined;
     // Don't let the gap across a resync be counted as a real frame interval.
     this._lastFrameArrival = null;
     this._setState('resyncing');
@@ -483,6 +486,7 @@ export class CameraStream extends EventTarget {
   _onDecoderError(error) {
     this._emit('error', { message: `Decoder: ${error.message}` });
     this._consecutiveDecoderErrors += 1;
+    this.cumulativeStats.decoderErrors += 1;
 
     if (this._consecutiveDecoderErrors >= this.options.maxConsecutiveDecoderErrors) {
       this._teardownSocket();
@@ -511,6 +515,7 @@ export class CameraStream extends EventTarget {
 
     while (this.frameQueue.length >= this.options.maxBufferedFrames) {
       this.frameQueue.shift().close();
+      this.cumulativeStats.dropsBuffer += 1;
     }
 
     this.frameQueue.push(frame);
@@ -580,20 +585,57 @@ export class CameraStream extends EventTarget {
       return;
     }
 
+    // If the queue has grown excessively (tab was backgrounded, device cannot
+    // keep up, or a large network stall just resolved), skip to the most
+    // recent frame to avoid a visible fast-forward.  The threshold is generous
+    // so normal TCP jitter never triggers a skip.
+    if (this.frameQueue.length > this.options.maxQueuedFrames) {
+      while (this.frameQueue.length > 1) {
+        this.frameQueue.shift().close();
+        this.cumulativeStats.dropsPump += 1;
+      }
+    }
+
+    // Proportional-Integral (PI) pacing: dynamically adjust the playback speed
+    // to keep the jitter buffer at a stable target depth. The Integral term
+    // automatically discovers the true framerate of the camera over a few seconds.
+    if (!this.pll) {
+      this.pll = {
+        integral: 1000 / this.options.nominalFps,
+        smoothedQueue: this.frameQueue.length
+      };
+    }
+
+    // Smooth the queue to avoid violent reactions to network bursts
+    this.pll.smoothedQueue = (this.pll.smoothedQueue * 0.8) + (this.frameQueue.length * 0.2);
+
+    // Target a healthy buffer of 6 frames.
+    const targetQueue = 6;
+    const error = this.pll.smoothedQueue - targetQueue;
+
+    // Integral gain (I): Slowly adjust baseline period to eliminate steady-state error.
+    const iGain = 0.5;
+    this.pll.integral -= (error * iGain);
+    this.pll.integral = Math.max(1000 / 60, Math.min(1000 / 5, this.pll.integral));
+
+    // Proportional gain (P): React instantly to current buffer depth.
+    const pGain = 4.0;
+    let dynamicPeriod = this.pll.integral - (error * pGain);
+    dynamicPeriod = Math.max(1000 / 60, Math.min(1000 / 5, dynamicPeriod));
+
     const now = performance.now();
-    const bufferedMs = this.frameQueue.length * this.framePeriodMs;
 
-    // Play out faster when the buffer overfills, so a burst drains instead of
-    // becoming permanent latency.
-    const period = bufferedMs > this.options.targetBufferMs * 2
-      ? this.framePeriodMs / 2
-      : this.framePeriodMs;
+    // If we missed our target by more than 200ms (e.g. queue empty due to stall),
+    // snap to `now` to prevent fast-forwarding when data resumes.
+    if (!this.nextDrawTime || now > this.nextDrawTime + 200) {
+      this.nextDrawTime = now;
+    }
 
-    if (now - this.lastDrawTime < period) {
+    if (now < this.nextDrawTime) {
       return;
     }
 
-    this.lastDrawTime = now;
+    this.nextDrawTime += dynamicPeriod;
     this._draw(this.frameQueue.shift());
   }
 
@@ -635,6 +677,10 @@ export class CameraStream extends EventTarget {
       receivedPerSecond: this._counters.received / elapsed,
       decodedPerSecond,
       bufferedFrames: this.frameQueue.length,
+      decodeQueue: this.decoder ? this.decoder.decodeQueueSize : 0,
+      dropsPump: this.cumulativeStats.dropsPump,
+      dropsBuffer: this.cumulativeStats.dropsBuffer,
+      decoderErrors: this.cumulativeStats.decoderErrors,
       state: this.stats.state,
     };
 

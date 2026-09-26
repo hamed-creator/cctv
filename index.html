@@ -227,6 +227,50 @@ document.addEventListener('visibilitychange', () => {
 // Exposed for console experimentation.
 Object.assign(window, { addCamera, removeCamera, stopStream, streams });
 
+setInterval(async () => {
+  try {
+    const response = await fetch('/api/cameras');
+    const cameras = await response.json();
+    let diagnosticHtml = `<table style="width:100%; border-collapse: collapse; text-align: left; font-size: 11px;">
+      <tr><th>Camera</th><th>State</th><th>Clients</th><th>FFmpeg KBs</th><th>SendQ</th><th>SoftDrops</th><th>HardDrops</th><th>C:FPS</th><th>C:DecQ</th><th>C:BufQ</th><th>C:PumpDrops</th><th>C:BufDrops</th><th>C:DecErr</th></tr>`;
+    
+    cameras.forEach((camera) => {
+      const entry = streams.get(String(camera.id));
+      let cStats = { fps: 0, decodeQueue: 0, bufferedFrames: 0, dropsPump: 0, dropsBuffer: 0, decoderErrors: 0 };
+      if (entry && entry.stream && entry.stream.stats) {
+        cStats = entry.stream.stats;
+      }
+      diagnosticHtml += `<tr style="border-bottom: 1px solid #444;">
+        <td>${camera.id}</td>
+        <td>${camera.state}</td>
+        <td>${camera.clients}</td>
+        <td>${camera.kilobytes}</td>
+        <td>${camera.sendQueue !== undefined ? camera.sendQueue : 0}</td>
+        <td>${camera.dropsSoft !== undefined ? camera.dropsSoft : 0}</td>
+        <td>${camera.dropsHard !== undefined ? camera.dropsHard : 0}</td>
+        <td>${cStats.fps ? cStats.fps.toFixed(1) : 0}</td>
+        <td>${cStats.decodeQueue}</td>
+        <td>${cStats.bufferedFrames}</td>
+        <td>${cStats.dropsPump}</td>
+        <td>${cStats.dropsBuffer}</td>
+        <td>${cStats.decoderErrors}</td>
+      </tr>`;
+    });
+    diagnosticHtml += `</table>`;
+    
+    let diagDiv = document.getElementById('diagnostics');
+    if (!diagDiv) {
+      diagDiv = document.createElement('div');
+      diagDiv.id = 'diagnostics';
+      diagDiv.style.cssText = 'position: fixed; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.8); color: #0f0; font-family: monospace; padding: 10px; z-index: 9999; max-height: 200px; overflow-y: auto;';
+      document.body.appendChild(diagDiv);
+    }
+    diagDiv.innerHTML = diagnosticHtml;
+  } catch (e) {
+    // Ignore fetch errors
+  }
+}, 1000);
+
 loadCameras().catch((error) => {
   wall.textContent = `Unable to load cameras: ${error.message}`;
 });
