@@ -413,20 +413,11 @@ class Camera extends EventEmitter {
         this.stats.keyframes += 1;
         this.lastKeyframe = buffer;
       }
-      // Queue frame for smoothed delivery instead of broadcasting instantly.
-      this.sendQueue.push({ buffer, keyframe, isReference });
+      // Broadcast instantly. UDP ingest has eliminated NVR burst stalls,
+      // so we no longer need to smooth out massive bursts. This eliminates
+      // the ~31ms timer quantization jitter in Node.js.
+      this.broadcast(buffer, keyframe, isReference);
     });
-
-    // Drain the send queue at a steady cadence (approx 20ms = 50 fps max drain rate)
-    // to smooth out pipe bursts before they hit the WebSocket. If a large burst
-    // arrived, drain slightly faster to avoid building permanent latency.
-    this.sendTimer = setInterval(() => {
-      const framesToDrain = this.sendQueue.length > 5 ? 2 : 1;
-      for (let i = 0; i < framesToDrain && this.sendQueue.length > 0; i++) {
-        const { buffer, keyframe, isReference } = this.sendQueue.shift();
-        this.broadcast(buffer, keyframe, isReference);
-      }
-    }, 20);
 
     child.stdout.on('data', (chunk) => {
       if (this.state !== CameraState.STREAMING) {
