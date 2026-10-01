@@ -477,7 +477,7 @@ export class CameraStream extends EventTarget {
     this._drainFrameQueue();
     this._createDecoder();
     this.nextDrawTime = null;
-    this.pll = undefined;
+    this.fpsEstimator = undefined;
     // Don't let the gap across a resync be counted as a real frame interval.
     this._lastFrameArrival = null;
     this._setState('resyncing');
@@ -596,34 +596,34 @@ export class CameraStream extends EventTarget {
       }
     }
 
-    // Proportional-Integral (PI) pacing: dynamically adjust the playback speed
-    // to keep the jitter buffer at a stable target depth. The Integral term
-    // automatically discovers the true framerate of the camera over a few seconds.
-    if (!this.pll) {
-      this.pll = {
-        integral: 1000 / this.options.nominalFps,
-        smoothedQueue: this.frameQueue.length
-      };
+    // Instead of a PI controller (which gets completely broken by the NVR's
+    // 1-second 10-frame bursts), we just count how many frames we've decoded
+    // in the last few seconds to find the true mathematical framerate.
+    if (!this.fpsEstimator) {
+      this.fpsEstimator = { frames: 0, startTime: performance.now(), currentPeriod: 1000 / 25 };
     }
 
-    // Smooth the queue to avoid violent reactions to network bursts
-    this.pll.smoothedQueue = (this.pll.smoothedQueue * 0.8) + (this.frameQueue.length * 0.2);
-
-    // Target a healthy buffer of 6 frames.
-    const targetQueue = 6;
-    const error = this.pll.smoothedQueue - targetQueue;
-
-    // Integral gain (I): Slowly adjust baseline period to eliminate steady-state error.
-    const iGain = 0.5;
-    this.pll.integral -= (error * iGain);
-    this.pll.integral = Math.max(1000 / 60, Math.min(1000 / 5, this.pll.integral));
-
-    // Proportional gain (P): React instantly to current buffer depth.
-    const pGain = 4.0;
-    let dynamicPeriod = this.pll.integral - (error * pGain);
-    dynamicPeriod = Math.max(1000 / 60, Math.min(1000 / 5, dynamicPeriod));
-
+    // Every 2 seconds, recalculate the true frame period
     const now = performance.now();
+    const elapsed = now - this.fpsEstimator.startTime;
+    if (elapsed >= 2000) {
+      const trueFps = this.fpsEstimator.frames / (elapsed / 1000);
+      if (trueFps > 2 && trueFps < 60) {
+        this.fpsEstimator.currentPeriod = 1000 / trueFps;
+      }
+      this.fpsEstimator.startTime = now;
+      this.fpsEstimator.frames = 0;
+    }
+
+    let dynamicPeriod = this.fpsEstimator.currentPeriod;
+
+    // Gentle buffer drift correction: if the NVR dumps a huge burst and our buffer
+    // grows past 15 frames, gently speed up by 10% to burn it off.
+    if (this.frameQueue.length > 15) {
+      dynamicPeriod *= 0.90; 
+    } else if (this.frameQueue.length < 2) {
+      dynamicPeriod *= 1.10;
+    }
 
     // If we missed our target by more than 200ms (e.g. queue empty due to stall),
     // snap to `now` to prevent fast-forwarding when data resumes.
@@ -636,6 +636,10 @@ export class CameraStream extends EventTarget {
     }
 
     this.nextDrawTime += dynamicPeriod;
+    
+    // Track drawn frames for the FPS estimator
+    this.fpsEstimator.frames += 1;
+
     this._draw(this.frameQueue.shift());
   }
 

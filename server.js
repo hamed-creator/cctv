@@ -619,7 +619,25 @@ class Camera extends EventEmitter {
       accessUnits: this.stats.accessUnits,
       keyframes: this.stats.keyframes,
       sendQueue: this.sendQueue ? this.sendQueue.length : 0,
-      kilobytes: Math.round(this.stats.bytes / 1024),
+      
+      // Compute actual KB/s since last poll
+      kilobytes: (() => {
+        const now = Date.now();
+        if (!this.stats.lastKbsCheck) {
+          this.stats.lastKbsCheck = { time: now, bytes: this.stats.bytes };
+          return 0;
+        }
+        const elapsed = (now - this.stats.lastKbsCheck.time) / 1000;
+        const bytesSince = this.stats.bytes - this.stats.lastKbsCheck.bytes;
+        
+        // Only update the baseline if enough time has passed to get a stable read (e.g. 1s)
+        if (elapsed >= 1) {
+          this.stats.lastKbsValue = Math.round((bytesSince / 1024) / elapsed);
+          this.stats.lastKbsCheck = { time: now, bytes: this.stats.bytes };
+        }
+        return this.stats.lastKbsValue || 0;
+      })(),
+
       uptimeSeconds: this.stats.startedAt
         ? Math.round((Date.now() - this.stats.startedAt) / 1000)
         : 0,
@@ -792,7 +810,7 @@ const statsTimer = setInterval(() => {
   }
 }, 10000);
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`Listening on http://localhost:${PORT}`);
   console.log(`Cameras configured: ${[...manager.cameras.keys()].join(', ')}`);
   console.log('Connect a client to ws://localhost:%d/camera/<id>', PORT);
