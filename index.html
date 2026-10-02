@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Camera wall</title>
+<link rel="icon" href="/favicon.jpg">
 <style>
   :root { color-scheme: light dark; }
   [hidden] { 
@@ -36,6 +37,7 @@
                min-width: 0; padding: 6px 10px; color: #ddd; font-size: 12px; }
   .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .stats { color: #999; white-space: nowrap; flex-shrink: 0; }
+  body.hide-analytics #diagnostics { display: none !important; }
 </style>
 </head>
 <body>
@@ -43,6 +45,7 @@
   <span id="live-count"></span>
   <button id="start-all" type="button">Start all</button>
   <button id="stop-all" type="button">Stop all</button>
+  <button id="toggle-analytics" type="button">Hide analytics</button>
 </div>
 <div class="grid" id="wall"></div>
 
@@ -53,8 +56,15 @@ const wall = document.querySelector('#wall');
 const liveCount = document.querySelector('#live-count');
 const startAllButton = document.querySelector('#start-all');
 const stopAllButton = document.querySelector('#stop-all');
+const toggleAnalyticsButton = document.querySelector('#toggle-analytics');
 const streams = new Map();
 const socketProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+toggleAnalyticsButton.addEventListener('click', () => {
+  document.body.classList.toggle('hide-analytics');
+  const isHidden = document.body.classList.contains('hide-analytics');
+  toggleAnalyticsButton.textContent = isHidden ? 'Show analytics' : 'Hide analytics';
+});
 
 function updateLiveCount() {
   const live = [...streams.values()].filter((entry) => entry.stream !== null).length;

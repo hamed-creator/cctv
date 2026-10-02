@@ -706,6 +706,7 @@ const manager = new CameraManager(loadCameraConfig());
 const STATIC_FILES = new Map([
   ['index.html', 'text/html; charset=utf-8'],
   ['app.js', 'text/javascript; charset=utf-8'],
+  ['favicon.jpg', 'image/jpeg'],
 ]);
 
 const httpServer = http.createServer((request, response) => {
